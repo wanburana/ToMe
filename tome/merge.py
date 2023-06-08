@@ -9,8 +9,43 @@ import math
 from typing import Callable, Tuple
 
 import torch
+from torch_cluster import fps
 
+def our_fps(metric, ratio=0.9):
+    BATCH_SIZE, N_TOKENS, N_DIM = metric.shape
+    batch = torch.repeat_interleave(torch.tensor([i for i in range(BATCH_SIZE)]), N_TOKENS)
+    metric = metric.reshape(BATCH_SIZE*N_TOKENS, -1)
 
+    # a_index = torch.stack([torch.arange(N_TOKENS,) for i in range(BATCH_SIZE)])
+    # a_mask = torch.ones((BATCH_SIZE, N_TOKENS), dtype=bool)
+
+    b_index = fps(metric, batch=batch, ratio=ratio, random_start=False)
+
+    b_index = b_index.reshape(BATCH_SIZE, -1)
+    b_index = b_index - b_index[:, 0, None]
+
+    return b_index
+    # metric = metric.reshape(BATCH_SIZE, N_TOKENS, -1)
+
+    # b = metric[torch.arange(BATCH_SIZE)[..., None], b_index]
+
+    # a_mask[torch.arange(BATCH_SIZE)[..., None], b_index] = False
+    # a = torch.stack([metric[i][a_mask[i]] for i in range(BATCH_SIZE)])
+
+    # return a, b
+
+def a_b_from_fps(metric, b_index):
+    BATCH_SIZE, N_TOKENS, N_DIM = metric.shape
+    a_mask = torch.ones((BATCH_SIZE, N_TOKENS), dtype=bool)
+
+    b = metric[torch.arange(BATCH_SIZE)[..., None], b_index]
+
+    a_mask[torch.arange(BATCH_SIZE)[..., None], b_index] = False
+    a = torch.stack([metric[i][a_mask[i]] for i in range(BATCH_SIZE)])
+
+    return a, b
+
+    
 def do_nothing(x, mode=None):
     return x
 
@@ -48,7 +83,15 @@ def bipartite_soft_matching(
 
     with torch.no_grad():
         metric = metric / metric.norm(dim=-1, keepdim=True)
-        a, b = metric[..., ::2, :], metric[..., 1::2, :]
+
+        b_index = our_fps(metric, ratio=0.6)
+        a, b = a_b_from_fps(metric, b_index)
+        print("our:", a.shape, b.shape)
+
+        # a, b = metric[..., ::2, :], metric[..., 1::2, :]
+        # print(a.shape, b.shape)
+        print('\n\n')
+
         scores = a @ b.transpose(-1, -2)
 
         if class_token:
@@ -67,8 +110,8 @@ def bipartite_soft_matching(
             # Sort to ensure the class token is at the start
             unm_idx = unm_idx.sort(dim=1)[0]
 
-    def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
-        src, dst = x[..., ::2, :], x[..., 1::2, :]
+    def merge(x: torch.Tensor, b_index, mode="mean") -> torch.Tensor:
+        src, dst = a_b_from_fps(x, b_index)
         n, t1, c = src.shape
         unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
         src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
@@ -79,7 +122,8 @@ def bipartite_soft_matching(
         else:
             return torch.cat([unm, dst], dim=1)
 
-    def unmerge(x: torch.Tensor) -> torch.Tensor:
+    def unmerge(x: torch.Tensor, b_index) -> torch.Tensor:
+        BATCH_SIZE = x.shape[0]
         unm_len = unm_idx.shape[1]
         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
         n, _, c = unm.shape
@@ -88,13 +132,14 @@ def bipartite_soft_matching(
 
         out = torch.zeros(n, metric.shape[1], c, device=x.device, dtype=x.dtype)
 
-        out[..., 1::2, :] = dst
+        # out[..., 1::2, :] = dst
+        out[torch.arange(BATCH_SIZE)[..., None], b_index] = dst
         out.scatter_(dim=-2, index=(2 * unm_idx).expand(n, unm_len, c), src=unm)
         out.scatter_(dim=-2, index=(2 * src_idx).expand(n, r, c), src=src)
 
         return out
 
-    return merge, unmerge
+    return merge, unmerge, b_index
 
 
 def kth_bipartite_soft_matching(
@@ -208,7 +253,7 @@ def random_bipartite_soft_matching(
 
 
 def merge_wavg(
-    merge: Callable, x: torch.Tensor, size: torch.Tensor = None
+    merge: Callable, x: torch.Tensor, b_index, size: torch.Tensor = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Applies the merge function by taking a weighted average based on token size.
@@ -217,15 +262,15 @@ def merge_wavg(
     if size is None:
         size = torch.ones_like(x[..., 0, None])
 
-    x = merge(x * size, mode="sum")
-    size = merge(size, mode="sum")
+    x = merge(x * size, b_index, mode="sum")
+    size = merge(size, b_index, mode="sum")
 
     x = x / size
     return x, size
 
 
 def merge_source(
-    merge: Callable, x: torch.Tensor, source: torch.Tensor = None
+    merge: Callable, x: torch.Tensor, b_index, source: torch.Tensor = None
 ) -> torch.Tensor:
     """
     For source tracking. Source is an adjacency matrix between the initial tokens and final merged groups.
@@ -235,5 +280,5 @@ def merge_source(
         n, t, _ = x.shape
         source = torch.eye(t, device=x.device)[None, ...].expand(n, t, t)
 
-    source = merge(source, mode="amax")
+    source = merge(source, b_index, mode="amax")
     return source
