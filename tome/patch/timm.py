@@ -40,7 +40,7 @@ class ToMeBlock(Block):
         r = self._tome_info["r"].pop(0)
         if r > 0:
             # Apply ToMe here
-            merge, _ = bipartite_soft_matching(
+            merge, _, b_index = bipartite_soft_matching(
                 metric,
                 r,
                 self._tome_info["class_token"],
@@ -48,9 +48,9 @@ class ToMeBlock(Block):
             )
             if self._tome_info["trace_source"]:
                 self._tome_info["source"] = merge_source(
-                    merge, x, self._tome_info["source"]
+                    merge, x, b_index, self._tome_info["source"]
                 )
-            x, self._tome_info["size"] = merge_wavg(merge, x, self._tome_info["size"])
+            x, self._tome_info["size"] = merge_wavg(merge, x, b_index, self._tome_info["size"])
 
         x = x + self._drop_path2(self.mlp(self.norm2(x)))
         return x
